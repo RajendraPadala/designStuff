@@ -1,0 +1,396 @@
+# CARE Project — 360° Interview Deep Dive
+### (CASS Mainframe Replacement — Collection Administration & Routing Engine)
+### Core Java · Spring Batch 2 · Hibernate 3 · MySQL/Oracle 10g · JBoss 5 · SOAP/Apache Camel/EXT JS
+
+---
+
+## 0. THE ELEVATOR PITCH — "Explain CARE from requirement to production"
+
+> "CARE was a client-server replacement for CASS, a legacy mainframe collections system that was being sunset. CASS's job was to take account data from upstream portfolio and behavioral-scoring systems and route delinquent accounts to the right collection resource — the right queue, the right collector, the right treatment strategy. CARE had to do everything CASS did, on a modern Java stack, without losing any of the operational guarantees a mainframe batch system already provided — checkpoint/restart, auditability, predictable nightly processing windows — while also opening the door to things a mainframe couldn't easily give the business: a modern EXT JS web UI for collection administrators, web-service integration points for other systems, and a maintainable Java codebase instead of decades-old mainframe logic that fewer and fewer people could safely change.
+>
+> My role spanned the full lifecycle: I gathered requirements directly from the client for new modules, contributed to both the high-level and detailed technical design, and provided estimates the PM used for scheduling. On the build side, I developed the batch layer using **Spring Batch 2** — nightly and intraday jobs pulling account and scoring data and applying routing rules — backed by **Hibernate 3** for persistence, with a **Generic DAO** pattern so every entity didn't need hand-rolled CRUD code. I built **Java service beans** wired through Spring holding the actual routing/business logic, exposed **SOAP web service modules** (via JAXP/Apache Camel routing) for other systems to integrate with CARE, and worked directly in **database modeling** sessions proposing and reviewing new tables as the data model evolved alongside requirements.
+>
+> Process-wise, we ran Agile with direct client interaction — I fed feature feedback back into design rather than just taking tickets — and I coordinated with an **offshore team**, making sure they understood requirements clearly enough to build correctly without needing constant clarification. I also drove **coding standards** for the team, did code reviews, ran **weekly tech lead meetings** to unblock issues, and reported status weekly to the manager.
+>
+> The single hardest part of the project, and the part most worth telling a deep story about, was that this wasn't greenfield — it was a **mainframe replacement**, meaning every design decision had to answer 'does this still do what CASS did, correctly, for a business that cannot tolerate collection accounts being mis-routed or silently dropped during the cutover.'"
+
+Use this as the cold open; the rest of this document backs every claim in it with functional detail, technical depth, code-level design, and incident-style scenarios.
+
+---
+
+## 1. BUSINESS / FUNCTIONAL — QUESTIONS & ANSWERS
+
+**Q1. What business problem does CARE solve?**
+Collections needs to know, every day, which delinquent accounts exist, how risky/collectible each one is (from the behavioral scoring system), and who should work each account (which collector, which queue, which strategy — e.g., early-stage self-cure letters vs. an experienced collector on a high-risk, high-balance account). CASS did this on a mainframe; CARE replaces that decision-and-routing engine with a maintainable client-server Java application while preserving the business rules that had accumulated in CASS over years.
+
+**Q2. Where does account data come from?**
+Two upstream sources drive CARE: the **portfolio system** (account-level data — balance, payment history, contract terms) and the **behavioral scoring system** (a risk/collectability score per account, likely refreshed on its own schedule). CARE's batch layer ingests both and joins them into a single view an account needs before it can be routed.
+
+**Q3. What does "routing" actually mean here?**
+Assigning each qualifying account to a **collection resource** — a specific queue, team, or individual collector — based on business rules keyed off score, delinquency stage, balance, prior contact history, and any account-level overrides an administrator has set. This is the functional heart of the system; everything else (batch ingestion, persistence, web services) exists to feed this decision and act on its output.
+
+**Q4. Who are the actual users, and what do they need?**
+**Collection administrators** — they don't write code or SQL, they need a UI (built in EXT JS, a rich JavaScript framework well-suited to data-grid-heavy admin tools of that era) to view account queues, override routing decisions, monitor collector workload, and manage the rules that drive routing — without needing IT involvement for every rule tweak.
+
+**Q5. What happens during a nightly batch cycle, end to end?**
+Ingest portfolio deltas → ingest updated behavioral scores → join/reconcile against existing CARE account records → apply routing rules to determine queue/collector assignment for new and re-evaluated accounts → persist updated account/routing state → make the updated data available to the EXT JS UI and to any downstream web-service consumers. Each of those is a distinct Spring Batch step, not one monolithic job (Section 3).
+
+**Q6. What happens to an account CASS/CARE has never seen before?**
+It's treated as a new account: fully evaluated against routing rules with no prior assignment history to consider, assigned to an initial queue, and its full state persisted — analogous to the "NEW" detection concept from other systems, but here the meaningful state machine is closer to **NEW → ROUTED → IN-COLLECTION → RESOLVED/CLOSED**, not a simple presence/absence diff.
+
+**Q7. What happens to an account that no longer appears in the portfolio feed (paid off, charged off, sold)?**
+It must be explicitly **closed/removed from active routing**, not silently left in a collector's queue forever — a stale routed account that should no longer be worked is a real operational cost (wasted collector effort) and a compliance concern (contacting someone about a debt that's already resolved). CARE's batch layer explicitly reconciles "accounts previously active but absent from the latest feed" as a distinct case requiring closure logic, not just an ingestion no-op.
+
+**Q8. How does a collection administrator override an automatic routing decision?**
+Through the EXT JS UI, which calls back into CARE's service layer (the same Spring-managed business-logic beans the batch layer uses) to apply a manual override — persisted distinctly from a rule-driven assignment (e.g., an `assignment_source` column: `RULE_ENGINE` vs `MANUAL_OVERRIDE`), so a subsequent batch re-evaluation knows not to silently clobber a deliberate human decision.
+
+**Q9. Why web services (SOAP) at all — who talks to CARE besides its own UI?**
+Other internal systems (reporting, possibly a dialer/contact-management system, possibly the portfolio system itself for status callbacks) need to query or update CARE data without going through the UI. SOAP with WSDL-defined contracts was the standard integration style for enterprise Java systems on this era's stack (JBoss 5, JAXP tooling) — a formally typed, versionable service contract other teams could code against reliably.
+
+**Q10. What was the actual cutover risk from CASS to CARE?**
+The core business risk: **an account silently mis-routed or dropped during migration** directly costs the business money (accounts not worked) or creates compliance exposure (wrong accounts contacted, or accounts contacted after resolution). This is *why* the design leaned so heavily on Spring Batch's checkpoint/restart and audit-trail capabilities (Section 3) — the same operational guarantees CASS's own mainframe batch scheduling already provided, deliberately preserved rather than casually assumed unnecessary on a "modern" platform.
+
+---
+
+## 2. TECHNICAL ARCHITECTURE — QUESTIONS & ANSWERS
+
+**Q1. Why Spring Batch 2 specifically for this replacement?**
+CASS was fundamentally a mainframe **batch** system — nightly/scheduled processing of large account volumes with checkpoint/restart semantics baked into how mainframe job scheduling (JCL-style) always worked. Spring Batch is the JVM ecosystem's direct conceptual analog: chunk-oriented step processing, a job repository tracking execution state, and skip/retry policies for fault tolerance — meaning the migration wasn't "replace batch processing with something else," it was "reimplement the same *kind* of system on a modern platform," which made the business case for correctness far easier to reason about and explain to stakeholders than a paradigm shift would have been.
+
+**Q2. Why Hibernate for persistence rather than raw JDBC?**
+The domain (accounts, scoring data, routing assignments, collector/queue metadata) is relationally rich with real object-graph relationships (an account has a routing history, a collector has many assigned accounts) — Hibernate's ORM mapping meant the team worked with Java domain objects and HQL rather than hand-writing JDBC boilerplate and manual result-set mapping for every query, and its second-level caching and lazy-loading controls mattered for a system with both heavy batch write volume and interactive UI read patterns.
+
+**Q3. Why a Generic DAO pattern instead of one DAO class per entity written independently?**
+A **Generic DAO** — a parameterized base class/interface (`GenericDao<T, ID>`) implementing common CRUD (`findById`, `save`, `delete`, `findAll`) against a Hibernate `Session` — meant every new entity (and CARE added many as new modules were built) got working persistence for free; entity-specific DAOs (`AccountDao extends GenericDao<Account, Long>`) only needed to add genuinely custom queries (e.g., `findAccountsByCollectorAndStatus`). This is the direct hand-written ancestor of what Spring Data JPA's `JpaRepository<T, ID>` industrialized years later — worth stating that connection explicitly in an interview, it signals you understand the pattern's lineage, not just its mechanics on this particular project.
+
+```java
+public interface GenericDao<T, ID extends Serializable> {
+    T findById(ID id);
+    List<T> findAll();
+    void save(T entity);
+    void update(T entity);
+    void delete(T entity);
+}
+
+public class GenericDaoImpl<T, ID extends Serializable> implements GenericDao<T, ID> {
+    private final Class<T> persistentClass;
+    private final SessionFactory sessionFactory;
+
+    @SuppressWarnings("unchecked")
+    public GenericDaoImpl(SessionFactory sessionFactory) {
+        this.sessionFactory = sessionFactory;
+        this.persistentClass = (Class<T>) ((ParameterizedType) getClass()
+                .getGenericSuperclass()).getActualTypeArguments()[0];
+    }
+
+    protected Session currentSession() {
+        return sessionFactory.getCurrentSession();
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public T findById(ID id) {
+        return (T) currentSession().get(persistentClass, id);
+    }
+
+    @Override
+    public void save(T entity) {
+        currentSession().saveOrUpdate(entity);
+    }
+    // update/delete/findAll follow the same pattern
+}
+```
+```java
+@Repository
+public class AccountDaoImpl extends GenericDaoImpl<Account, Long> implements AccountDao {
+
+    public AccountDaoImpl(SessionFactory sessionFactory) { super(sessionFactory); }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public List<Account> findUnroutedAccountsByScoreThreshold(BigDecimal minScore) {
+        return currentSession()
+            .createQuery("from Account a where a.routingStatus = :status and a.behaviorScore >= :minScore")
+            .setParameter("status", RoutingStatus.PENDING)
+            .setParameter("minScore", minScore)
+            .list();
+    }
+}
+```
+
+**Q4. Why Java beans + Spring for the business logic layer rather than putting logic in the DAOs or the batch steps directly?**
+Separation of concerns: DAOs know persistence, batch `ItemProcessor`s know how to drive a chunked pipeline, but the actual **routing decision logic** (which queue, which collector, which override rules apply) is domain logic that both the batch layer *and* the UI-facing service layer (for manual overrides, Q8 above) need to call identically — putting it in Spring-managed service beans meant one implementation, testable in isolation via dependency injection, reused by both callers instead of duplicated or awkwardly reached-into from a batch step.
+
+**Q5. What did database modeling/review meetings actually involve, concretely?**
+Proposing new tables/columns as new modules were designed (e.g., adding an `assignment_source` column for Q8, or a new table for a manually-configurable routing-rule set an administrator could edit without a code deploy), reviewing them with other technical leads/DBAs for normalization correctness, indexing strategy against expected query patterns (collector dashboards querying "my current queue" needed to be fast even as the accounts table grew), and naming/typing consistency across the growing schema — the kind of governance that keeps a schema coherent as many engineers (including an offshore team) add to it over the project's life.
+
+**Q6. Why SOAP and not REST, given this era's stack?**
+This was standard enterprise Java practice at the time (JBoss 5, JAXP-based tooling) — SOAP/WSDL gave a **strongly-typed, contract-first** integration point other internal teams could generate client stubs from reliably, which mattered more than REST's simplicity for internal, tightly-coordinated enterprise integrations of that era. (Worth being able to add, if asked "would you do this differently today": yes — a modern equivalent system would very likely expose REST/JSON, precisely for the lighter-weight, more universally consumable integration REST offers, and that evolution reflects how the whole industry's default shifted, not that SOAP was a wrong choice *for its time*.)
+
+**Q7. What was Apache Camel's role specifically?**
+Camel provided **routing and mediation** between CARE and other systems/feeds — implementing **Enterprise Integration Patterns** (content-based routing, transformation, protocol bridging) declaratively rather than hand-writing custom integration glue code for every feed source. For example, an inbound portfolio-system feed arriving via a specific transport/format could be routed, transformed (XML transformation via JAXP), and handed off to the batch ingestion layer through a Camel route rather than bespoke, one-off integration code per feed.
+
+```xml
+<route id="portfolioFeedIngestionRoute">
+    <from uri="file:/data/inbound/portfolio?noop=true"/>
+    <log message="Received portfolio feed file: ${header.CamelFileName}"/>
+    <choice>
+        <when>
+            <xpath>/PortfolioFeed/Header/FeedType = 'DELTA'</xpath>
+            <to uri="direct:processDeltaFeed"/>
+        </when>
+        <otherwise>
+            <to uri="direct:processFullFeed"/>
+        </otherwise>
+    </choice>
+</route>
+<route id="deltaFeedRoute">
+    <from uri="direct:processDeltaFeed"/>
+    <to uri="xslt:transform/portfolioDeltaToCareFormat.xsl"/>
+    <to uri="jms:queue:care.account.ingestion"/>
+</route>
+```
+
+**Q8. Why JBoss 5 as the application server, and what did that mean operationally?**
+JBoss 5 was the standard, enterprise-supported Java EE application server for the era's stack — providing the servlet container, JMS, transaction management, and web-service hosting CARE needed in one managed runtime, rather than assembling those individually. Operationally, deployments were EAR/WAR-based (not the containerized, immutable-artifact deploys common today), so release coordination (the "deploying code changes" bullet point) meant careful attention to in-place server restarts/redeploys, session handling across a redeploy, and coordinating deployment windows around the batch schedule so a redeploy never landed mid-nightly-run.
+
+---
+
+## 3. DESIGN & IMPLEMENTATION — SPRING BATCH 2 JOB DESIGN
+
+### The nightly account-routing job, step by step
+
+```
+Step 1: ingestPortfolioDelta      (chunk-oriented: read file -> process -> write to staging table)
+Step 2: ingestBehavioralScores    (chunk-oriented: read file -> process -> write to staging table)
+Step 3: reconcileAccounts         (tasklet: join staging data into the live accounts table,
+                                    detect NEW / UPDATED / MISSING-FROM-FEED accounts)
+Step 4: closeStaleAccounts        (chunk-oriented: MISSING-FROM-FEED accounts -> close routing)
+Step 5: applyRoutingRules         (chunk-oriented: PENDING accounts -> evaluate rules -> assign)
+Step 6: publishRoutingUpdates     (tasklet: notify UI-facing cache / downstream consumers)
+```
+
+Spring Batch 2 XML job configuration (representative of this project's actual configuration style, pre-Java-config-era Spring Batch):
+```xml
+<job id="nightlyAccountRoutingJob" xmlns="http://www.springframework.org/schema/batch">
+    <step id="ingestPortfolioDelta" next="ingestBehavioralScores">
+        <tasklet>
+            <chunk reader="portfolioFileReader"
+                   processor="portfolioRecordProcessor"
+                   writer="portfolioStagingWriter"
+                   commit-interval="500"
+                   skip-limit="100">
+                <skippable-exception-classes>
+                    <include class="com.care.batch.exception.RecordValidationException"/>
+                </skippable-exception-classes>
+            </chunk>
+        </tasklet>
+    </step>
+
+    <step id="ingestBehavioralScores" next="reconcileAccounts">
+        <tasklet>
+            <chunk reader="scoringFileReader" processor="scoringRecordProcessor"
+                   writer="scoringStagingWriter" commit-interval="500"/>
+        </tasklet>
+    </step>
+
+    <step id="reconcileAccounts" next="closeStaleAccounts">
+        <tasklet ref="accountReconciliationTasklet"/>
+    </step>
+
+    <step id="closeStaleAccounts" next="applyRoutingRules">
+        <tasklet>
+            <chunk reader="staleAccountReader" processor="accountClosureProcessor"
+                   writer="accountWriter" commit-interval="200"/>
+        </tasklet>
+    </step>
+
+    <step id="applyRoutingRules" next="publishRoutingUpdates">
+        <tasklet>
+            <chunk reader="pendingAccountReader" processor="routingRuleProcessor"
+                   writer="accountWriter" commit-interval="200"
+                   retry-limit="3">
+                <retryable-exception-classes>
+                    <include class="org.springframework.dao.TransientDataAccessException"/>
+                </retryable-exception-classes>
+            </chunk>
+        </tasklet>
+    </step>
+
+    <step id="publishRoutingUpdates">
+        <tasklet ref="publishUpdatesTasklet"/>
+    </step>
+</job>
+```
+
+**Design rationale worth stating explicitly**: this job is deliberately decomposed into **many small steps** rather than one monolithic tasklet, mirroring the same "capture first, analyze later"-style discipline seen elsewhere — each step's completion is independently checkpointed in Spring Batch's job repository, so a failure during `applyRoutingRules` (Step 5) restarts from Step 5 on the next run, **not** by re-ingesting the portfolio and scoring feeds again from scratch — directly analogous to how the mainframe's own job-scheduling checkpoint/restart worked, which was the explicit design goal of the migration (Section 2, Q1).
+
+### Java beans / service layer wiring (Spring, XML-configuration era)
+```xml
+<bean id="accountDao" class="com.care.dao.AccountDaoImpl">
+    <constructor-arg ref="sessionFactory"/>
+</bean>
+
+<bean id="routingRuleEngine" class="com.care.service.RoutingRuleEngineImpl">
+    <property name="accountDao" ref="accountDao"/>
+    <property name="collectorAssignmentDao" ref="collectorAssignmentDao"/>
+    <property name="ruleRepository" ref="routingRuleRepository"/>
+</bean>
+
+<bean id="routingRuleProcessor" class="com.care.batch.RoutingRuleItemProcessor">
+    <property name="routingRuleEngine" ref="routingRuleEngine"/>
+</bean>
+```
+```java
+@Service
+public class RoutingRuleEngineImpl implements RoutingRuleEngine {
+
+    private final AccountDao accountDao;
+    private final CollectorAssignmentDao collectorAssignmentDao;
+    private final RoutingRuleRepository ruleRepository;
+
+    // constructor injection -- same rationale as any modern Spring service:
+    // fail-fast at container start-up if a collaborator is missing, and
+    // trivially mockable in isolation for unit tests.
+    public RoutingRuleEngineImpl(AccountDao accountDao,
+                                  CollectorAssignmentDao collectorAssignmentDao,
+                                  RoutingRuleRepository ruleRepository) {
+        this.accountDao = accountDao;
+        this.collectorAssignmentDao = collectorAssignmentDao;
+        this.ruleRepository = ruleRepository;
+    }
+
+    @Override
+    public RoutingDecision evaluate(Account account) {
+        if (account.hasManualOverride()) {
+            // Q8: a human decision must never be silently clobbered by rule re-evaluation
+            return RoutingDecision.preserveManualAssignment(account);
+        }
+        List<RoutingRule> applicableRules = ruleRepository.findActiveRulesForSegment(account.getSegment());
+        for (RoutingRule rule : applicableRules) {
+            if (rule.matches(account)) {
+                Collector target = collectorAssignmentDao.findLeastLoadedCollector(rule.getQueue());
+                return RoutingDecision.assign(account, rule.getQueue(), target, rule.getId());
+            }
+        }
+        return RoutingDecision.assign(account, defaultQueue(), null, null);
+    }
+}
+```
+
+### Hibernate mapping (representative of Hibernate 3-era style — XML mapping alongside annotations was common)
+```xml
+<hibernate-mapping>
+    <class name="com.care.domain.Account" table="ACCOUNT">
+        <id name="id" column="ACCOUNT_ID">
+            <generator class="native"/>
+        </id>
+        <property name="crdNumber" column="ACCT_NUMBER" not-null="true" unique="true"/>
+        <property name="balance" column="BALANCE" type="big_decimal"/>
+        <property name="behaviorScore" column="BEHAVIOR_SCORE" type="big_decimal"/>
+        <property name="routingStatus" column="ROUTING_STATUS">
+            <type name="org.hibernate.type.EnumType">
+                <param name="enumClass">com.care.domain.RoutingStatus</param>
+            </type>
+        </property>
+        <property name="assignmentSource" column="ASSIGNMENT_SOURCE"/>
+        <many-to-one name="assignedCollector" column="COLLECTOR_ID"
+                     class="com.care.domain.Collector" fetch="select" lazy="proxy"/>
+        <set name="routingHistory" table="ACCOUNT_ROUTING_HISTORY" inverse="true" lazy="true">
+            <key column="ACCOUNT_ID"/>
+            <one-to-many class="com.care.domain.RoutingHistoryEntry"/>
+        </set>
+    </class>
+</hibernate-mapping>
+```
+**Design note worth voicing**: `assignedCollector` is mapped `lazy="proxy"` deliberately — the batch layer processing thousands of accounts per chunk should not eagerly join-fetch full collector details for every account by default (classic N+1-avoidance-by-being-deliberate-about-laziness, the same underlying principle as the N+1 discussion in the general Hibernate/JPA material, just expressed in Hibernate 3's mapping-file idiom rather than annotations); the UI-facing service layer, which genuinely needs collector detail per displayed account, explicitly uses a `JOIN FETCH` HQL query at that specific call site instead of relying on the default lazy proxy triggering N+1 lazy loads per row.
+
+---
+
+## 4. DESIGN PATTERNS CATALOG — THIS PROJECT SPECIFICALLY
+
+| Pattern | Where in CARE | Why |
+|---|---|---|
+| **Generic DAO** | `GenericDao<T, ID>` + entity-specific DAOs | Reusable CRUD, entity DAOs only add genuinely custom queries |
+| **Template Method** | Spring Batch's chunk-oriented step (read→process→write loop) | Framework owns the loop; project supplies the specifics |
+| **Strategy** | `RoutingRule` implementations, pluggable per business segment | Swap/extend routing logic without touching the engine that applies it |
+| **Facade** | `RoutingRuleEngine` service bean | Both batch and UI-facing callers get one simple entry point hiding DAO/rule-repository complexity |
+| **Pipes and Filters / Content-Based Router / Message Translator** (EIPs) | Apache Camel routes | Declarative integration mediation instead of hand-written glue code per feed |
+| **Dependency Injection** | Every Spring-managed bean (DAOs, services, batch components) | Testability, fail-fast wiring, decoupling — identical rationale to any modern Spring codebase |
+| **Strangler Fig** (at the program level, not literal code) | The overall CASS→CARE migration strategy | New functionality built and validated on CARE while CASS continued operating, rather than a single risky flash-cutover |
+
+---
+
+## 5. SYSTEM DESIGN TRADE-OFFS
+
+| Decision | Alternative rejected | Why |
+|---|---|---|
+| Spring Batch's chunked, checkpointed jobs | A simpler single-pass script/loop | Preserves the mainframe's own checkpoint/restart operational guarantee — non-negotiable for a system this business-critical |
+| Generic DAO + Hibernate | Hand-written JDBC per entity | Faster to extend as new modules were added across the project's life, less boilerplate duplicated by (and inconsistent across) the offshore team |
+| SOAP/WSDL contracts | An ad-hoc/proprietary integration format | Strong, versionable, tooling-generatable contracts for other internal teams integrating with CARE, standard for the era's Java EE stack |
+| Apache Camel for feed mediation | Hand-written integration code per feed source/format | Declarative EIP routing scales better as more feed sources are added; less duplicated parsing/transformation logic |
+| `assignment_source` column distinguishing manual vs. rule-driven routing | Treating every assignment identically | Prevents automated re-evaluation from silently overwriting a deliberate human override — a real, easy-to-get-wrong correctness requirement |
+| Decomposing the nightly job into many small steps | One large tasklet doing everything | Independently checkpointed/restartable steps; a failure deep in routing logic doesn't force re-ingesting feeds already successfully processed |
+
+---
+
+## 6. CHALLENGE SCENARIO — "The portfolio feed volume grew 5x after a new business line was onboarded, and the nightly batch window started running long enough to bump into business hours"
+
+Walk it the same way any batch-scale challenge is walked:
+
+- **Batching/chunking**: revisit `commit-interval` sizing — too small means excessive per-chunk transaction overhead at 5x volume; too large means longer-held transactions and larger rollback segments on a mid-chunk failure. Re-tune empirically against the new volume rather than assuming the original tuning still holds.
+- **Parallelization**: Spring Batch 2 supports **partitioned steps** — splitting the account population across multiple parallel worker threads/steps by a partition key (e.g., account-number range or portfolio segment), directly addressing a batch window that no longer fits — this is the period-appropriate equivalent of the "parallel processing consumer" scaling concept from more modern event-driven pipelines.
+- **Database indexing**: at 5x row volume, indexes tuned for the old volume may no longer serve the reconciliation/routing queries efficiently — a database review pass (tying back to the "database modeling and review meetings" bullet) to validate index selectivity against the new data distribution.
+- **Skip/retry limits**: revisit `skip-limit`/`retry-limit` — a fixed absolute skip limit that was reasonable at the old volume might now silently mask a genuinely elevated error rate at 5x scale; consider a percentage-based sanity check layered on top (a very high skip count at the new volume might still be a *low percentage*, which is a different signal than the same count was at the old volume).
+- **Business-schedule negotiation**: sometimes the honest answer isn't purely technical — if the batch window genuinely cannot be compressed enough even after tuning, the conversation escalates to "can the batch start earlier / can non-critical steps like `publishRoutingUpdates` run on a slightly delayed schedule without operationally mattering" — a good answer shows you know engineering trade-offs sometimes need a business conversation, not just more tuning.
+
+---
+
+## 7. PRODUCTION SCENARIO — "A JBoss redeploy overlapped with the tail end of the nightly batch window and the routing job failed mid-step"
+
+Follow the same detect → investigate → root cause → contain → recover → replay → validate → communicate → prevent-recurrence shape used elsewhere, applied to this stack specifically:
+
+**Detect**: the batch job's failure is visible in the Spring Batch job repository (`BATCH_JOB_EXECUTION` showing `FAILED` status) — an operational monitoring job/alert watching job-completion status (this era's equivalent of a modern job-completion heartbeat check) pages on-call.
+
+**Investigate**: application/server logs around the failure timestamp show the JBoss redeploy event overlapping the `applyRoutingRules` step's execution window — the redeploy tore down and recreated the application context (including the `SessionFactory`/connection pool) while the batch job was mid-chunk, producing connection-related exceptions.
+
+**Root cause**: a deployment-scheduling gap — releases were coordinated around the batch schedule in principle (Section 2, Q8), but this specific release's timing didn't account for the batch window having grown (Section 6's scenario) and now running later than the deployment process assumed.
+
+**Contain**: confirm no other in-flight processes are also affected by the same redeploy; confirm the routing engine hasn't left any accounts in a half-updated, inconsistent state (this is exactly why chunk-oriented, transactionally-bounded steps matter — a failure mid-chunk means the *last committed chunk* is a clean, consistent boundary to resume from, not an arbitrary torn state).
+
+**Recover**: restart the job — Spring Batch resumes from the last successfully completed step/chunk (Section 3's design), not from scratch.
+
+**Replay/Validate**: confirm the reconciliation counts balance (accounts processed across the resumed run plus the prior completed portion should match the expected total from the ingested feeds) before considering the run complete.
+
+**Communicate**: notify the collections operations team of the delayed batch completion and, if the delay pushed into business hours, flag which collector queues may have stale data until the run finishes.
+
+**Prevent recurrence**: fix the actual gap — either move deployment windows to a hard cutoff genuinely earlier than the *worst-case* (not typical-case) batch completion time, or add an explicit pre-deployment check that refuses to proceed with a redeploy while a batch job is still `STARTED` in the job repository — turning a schedule-coordination assumption into an enforced, automated gate instead of relying on people remembering to check.
+
+---
+
+## 8. PROCESS & LEADERSHIP — QUESTIONS & ANSWERS (the bullets beyond pure code)
+
+**Q1. How did you approach estimating for business requirements?**
+Break a requirement down to the same granularity as the technical design (a new routing rule type, a new DAO/service method, a new batch step or web-service operation, a schema change requiring a review-meeting pass) and estimate at that level rather than as one opaque number for the whole feature — this both produces a more defensible estimate and doubles as an early design sanity-check, since a requirement that's hard to decompose cleanly is often a sign the requirement itself isn't fully understood yet.
+
+**Q2. How did you coordinate with the offshore team effectively?**
+Made sure design decisions and requirements were captured in reviewed, written technical design documentation *before* handing off work, specifically because a narrow timezone-overlap window means a blocked offshore engineer waiting on a clarifying answer loses far more time than the same block would cost a co-located team — the same "explicit over implicit communication" principle that governs any distributed-team collaboration, applied here concretely through HLD/LLD documents and clear DAO/service interface contracts the offshore team could implement against without needing to guess intent.
+
+**Q3. What did weekly tech lead meetings actually accomplish?**
+A standing forum to surface blockers across the team before they became schedule risks — a batch performance concern, an ambiguous requirement, an integration question about how a new web-service module should behave — addressed as a group rather than each engineer separately escalating (or not escalating) individually, and a place to align on emerging coding-convention decisions before they organically diverged across parts of the codebase built by different people.
+
+**Q4. What coding conventions/standards did you actually establish, concretely?**
+Consistent DAO/service layering discipline (no business logic leaking into DAOs, no direct Hibernate `Session` access from batch processors bypassing the DAO layer), consistent exception-handling patterns (skippable vs. fatal exceptions clearly distinguished at the batch layer, per Section 3's job config), and consistent Hibernate mapping conventions (naming, lazy-loading defaults) — the kind of decisions that matter disproportionately on a project with an offshore team and multiple contributors, because inconsistency compounds badly at that scale versus a small, tightly co-located team where informal alignment happens naturally.
+
+**Q5. How did you handle client feedback that conflicted with the original design?**
+Treated it as a normal part of Agile delivery rather than as scope creep to resist by default — fed it back into the HLD/LLD, re-estimated the delta explicitly rather than silently absorbing it into the existing schedule, and made sure the client understood the trade-off (schedule/scope impact) rather than the change happening invisibly — the same "state the trade-off explicitly" discipline that shows up throughout the technical design decisions in this document, applied to the client-facing/process side of the role.
+
+---
+
+## 9. QUICK-FIRE CHEAT SHEET
+
+- **One-line pitch**: "A mainframe collections-routing system replacement, built on Spring Batch/Hibernate, that had to preserve CASS's checkpoint/restart and auditability guarantees while adding a modern UI and web-service integration surface."
+- **The hardest design constraint**: not greenfield — every decision had to answer "does this still do what the mainframe did, correctly."
+- **The pattern worth naming unprompted**: Generic DAO as the direct hand-written ancestor of Spring Data JPA repositories — shows you understand the pattern's lineage.
+- **The trade-off worth defending**: SOAP over REST was right *for its era and stack*, not a permanent architectural stance — shows evolving judgment, not dogma.
+- **The incident story**: batch job colliding with a JBoss redeploy — shows you understand chunk-level checkpointing as a real operational safety net, not just a config option.

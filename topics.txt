@@ -1,0 +1,78 @@
+
+► 1. Core technical foundations
+
+ Networking and latency
+ ↳ Basic numbers in your head (disk, LAN, cross region)
+ ↳ DNS, TCP handshake, HTTP, TLS termination, connection pooling
+ ↳ Load balancers, reverse proxies, keep alive, timeouts
+
+ OS and concurrency basics
+ ↳ Processes vs threads, blocking vs non blocking I/O
+ ↳ Context switching, file descriptors, connection limits
+ ↳ How kernels treat sockets, queues, and memory pressure
+
+ Data formats and APIs
+ ↳ JSON, protobuf, gRPC, REST, WebSockets, long polling
+ ↳ Idempotent methods, pagination, versioning, rate limits
+
+Btw, I've compiled all fundamental ideas like this, with 90+ other system design fundamentals, into a guide for Senior-to-Principal engineers for interview preparation.
+
+You can check it out here: puneetpatwari.in
+
+► 2. Request flow and boundaries
+
+ End to end request lifecycle
+ ↳ From client to CDN to gateway to service to DB and back
+ ↳ Where to cache, where to authenticate, where to apply rate limits
+
+ Sync vs async
+ ↳ When a request must block until work is done
+ ↳ When to hand off to queues or streams and return early
+ ↳ Fan in / fan out patterns, background workers, schedulers
+
+ Service decomposition
+ ↳ When one service is enough, when to split
+ ↳ Clear ownership of data and APIs
+ ↳ How services talk to each other, and what happens when one is slow
+
+► 3. Data modeling and storage choices
+
+ Data modeling
+ ↳ Identify core entities, relationships, access patterns
+ ↳ Normalization vs denormalization, composite keys, soft delete
+
+ Storage engines
+ ↳ Relational DBs vs key value stores vs document stores vs time series
+ ↳ Indexes, partitions, sharding vs federation
+ ↳ Hot vs cold data, archival, retention policies
+
+ Caching
+ ↳ Client side, CDN, application cache, database cache
+ ↳ Cache aside, write through, write behind
+ ↳ Invalidation, TTL, stampede protection, cache keys design
+
+► 4. Scale and performance patterns
+
+ Throughput and capacity
+ ↳ QPS, p95 latency, concurrency limits
+ ↳ Vertical vs horizontal scale, stateless services, auto scaling basics
+
+ Protecting systems
+ ↳ Rate limiting, quotas, backpressure
+ ↳ Circuit breakers, timeouts, bulkheads
+ ↳ Queues for smoothing spikes, dead letter queues
+
+ Heavy features
+ ↳ Search, feed generation, recommendation, reporting
+ ↳ Pre compute vs on demand, batching, sampling
+
+► 5. Reliability and correctness
+
+ Redundancy and failover
+ ↳ Replication, leader follower, multi AZ, multi region basics
+ ↳ Health checks, failover triggers, graceful degradation
+
+ Consistency
+ ↳ Strong vs eventual, read your own writes, monotonic reads
+ ↳ Where you can relax consistency for user experience or scale
+ ↳ Idempotency keys, retry semantics
